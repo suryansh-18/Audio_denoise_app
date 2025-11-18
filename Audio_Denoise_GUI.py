@@ -4,9 +4,27 @@
 import streamlit as st
 import numpy as np
 import io, os, tempfile
-import matplotlib.pyplot as plt
+# Defensive plotting imports: matplotlib preferred, fallback to plotly
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    MATPLOTLIB_AVAILABLE = True
+except Exception:
+    plt = None
+    PdfPages = None
+    MATPLOTLIB_AVAILABLE = False
+
+# Try Plotly as a fallback for plotting in Streamlit
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    PLOTLY_AVAILABLE = True
+except Exception:
+    go = None
+    px = None
+    PLOTLY_AVAILABLE = False
+
 from scipy import signal
-from matplotlib.backends.backend_pdf import PdfPages
 import wave
 
 # Optional backends
@@ -135,6 +153,86 @@ def write_audio_fileobj(fileobj, data, fs):
         write_wav_fallback(tmp.name, data, fs)
         with open(tmp.name,'rb') as f: fileobj.write(f.read())
         os.remove(tmp.name)
+
+# ---- Helper display functions (works with matplotlib or plotly) ----
+def display_waveform(audio, fs, title="Waveform (first 5s)", max_seconds=5):
+    """Return ('mpl', fig) or ('plotly', fig) or ('none', None)."""
+    max_samples = min(len(audio), int(fs * max_seconds))
+    t = np.arange(max_samples) / float(fs)
+    y = audio[:max_samples]
+
+    if MATPLOTLIB_AVAILABLE:
+        fig, ax = plt.subplots(figsize=(8, 2))
+        ax.plot(t, y)
+        ax.set_title(title)
+        ax.set_xlabel("Time (s)")
+        return ("mpl", fig)
+    elif PLOTLY_AVAILABLE:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=t, y=y, mode='lines', name=title))
+        fig.update_layout(title=title, xaxis_title='Time (s)', height=240, margin=dict(l=20,r=20,t=40,b=20))
+        return ("plotly", fig)
+    else:
+        return ("none", None)
+
+
+def display_spectrogram(audio, fs, nperseg=2048, title="Spectrogram"):
+    """Return ('mpl', fig) or ('plotly', fig) or ('none', None)."""
+    f, t, Sxx = signal.spectrogram(audio, fs=fs, nperseg=nperseg)
+    S_db = 10.0 * np.log10(Sxx + 1e-12)
+
+    if MATPLOTLIB_AVAILABLE:
+        fig, ax = plt.subplots(figsize=(8, 3))
+        pcm = ax.pcolormesh(t, f, S_db, shading='gouraud')
+        ax.set_ylabel('Frequency [Hz]')
+        ax.set_xlabel('Time [s]')
+        ax.set_title(title)
+        fig.colorbar(pcm, ax=ax, format='%+2.0f dB')
+        return ("mpl", fig)
+    elif PLOTLY_AVAILABLE:
+        fig = go.Figure(data=go.Heatmap(
+            x=t,
+            y=f,
+            z=S_db,
+            colorscale='Viridis',
+            zmin=np.percentile(S_db, 1),
+            zmax=np.percentile(S_db, 99),
+            colorbar=dict(title='dB')
+        ))
+        fig.update_layout(title=title, xaxis_title='Time (s)', yaxis_title='Frequency (Hz)', height=360, margin=dict(l=40,r=20,t=40,b=20))
+        return ("plotly", fig)
+    else:
+        return ("none", None)
+
+
+def build_pdf_report_safe(pdf_buf, noisy_signal, processed_signal, fs, title="Auto Denoise Report"):
+    """Create a PDF report only if matplotlib.PdfPages is available.
+    Writes bytes into pdf_buf (BytesIO) and returns True on success, False if not available.
+    """
+    if not MATPLOTLIB_AVAILABLE or PdfPages is None:
+        return False
+
+    import matplotlib
+    matplotlib.rcParams.update({'figure.max_open_warning': 0})
+    with PdfPages(pdf_buf) as pdf:
+        # cover
+        fig_cover = plt.figure(figsize=(8.27, 11.69))
+        plt.axis('off')
+        plt.text(0.5, 0.9, title, ha='center', fontsize=16)
+        pdf.savefig(fig_cover)
+        plt.close(fig_cover)
+
+        # Spectrogram page
+        fig_s, ax_s = plt.subplots(2, 1, figsize=(8.27, 11.69))
+        f1, t1, S1 = signal.spectrogram(noisy_signal, fs=fs, nperseg=2048)
+        ax_s[0].pcolormesh(t1, f1, 10*np.log10(S1+1e-12), shading='gouraud')
+        ax_s[0].set_title('Spectrogram - Noisy')
+        f2, t2, S2 = signal.spectrogram(processed_signal, fs=fs, nperseg=2048)
+        ax_s[1].pcolormesh(t2, f2, 10*np.log10(S2+1e-12), shading='gouraud')
+        ax_s[1].set_title('Spectrogram - Processed')
+        pdf.savefig(fig_s)
+        plt.close(fig_s)
+    return True
 
 # ---------------- DSP helpers ----------------
 def rms(x): return np.sqrt(np.mean(np.square(x)))
@@ -377,10 +475,13 @@ if np.max(np.abs(noisy_data))>0: noisy_data = noisy_data/(np.max(np.abs(noisy_da
 st.header("Input preview")
 c1, c2 = st.columns([2,1])
 with c1:
-    fig, ax = plt.subplots(figsize=(8,2))
-    ax.plot(np.arange(min(len(noisy_data), fs*5))/fs, noisy_data[:min(len(noisy_data), fs*5)])
-    ax.set_title("Noisy waveform (first 5s)"); ax.set_xlabel("Time (s)")
-    st.pyplot(fig)
+    kind, fig_or_none = display_waveform(noisy_data, fs, title='Noisy waveform (first 5s)', max_seconds=5)
+    if kind == "mpl":
+        st.pyplot(fig_or_none)
+    elif kind == "plotly":
+        st.plotly_chart(fig_or_none, use_container_width=True)
+    else:
+        st.info("Plot unavailable (matplotlib/plotly not installed).")
 with c2:
     buf_in = io.BytesIO(); write_audio_fileobj(buf_in, noisy_data, fs); buf_in.seek(0)
     st.audio(buf_in.read())
@@ -390,8 +491,8 @@ def restore_lowband_and_match(original, processed, fs, cutoff_hz, mix):
     # extract low bands
     Wn,_ = _clamp_normalized_cutoff(cutoff_hz, fs)
     b_lp,a_lp = signal.butter(4, Wn, btype='low')
-    orig_low = signal.filtfilt(b_lp, a_lp, original)
-    proc_low = signal.filtfilt(b_lp, a_lp, processed)
+    orig_low = signal.filtfilt(b_lp,a_lp,original)
+    proc_low = signal.filtfilt(b_lp,a_lp,processed)
     proc_high = processed - proc_low
     # RMS match: scale orig_low to match proc_low RMS if needed (to avoid overpowering)
     rms_orig = rms(orig_low) + 1e-12
@@ -469,18 +570,49 @@ if st.session_state.get('run_request', False) or sweep_btn:
         select_label = st.selectbox("Choose result to preview", options=list(results.keys()))
         sel_sig, sel_desc = results[select_label]
         st.write(f"Params: {sel_desc}")
-        fig2, axs = plt.subplots(2,1, figsize=(8,4))
-        axs[0].plot(np.arange(min(len(noisy_data), fs*5))/fs, noisy_data[:min(len(noisy_data), fs*5)]); axs[0].set_title("Noisy (first 5s)")
-        axs[1].plot(np.arange(min(len(sel_sig), fs*5))/fs, sel_sig[:min(len(sel_sig), fs*5)]); axs[1].set_title(f"{select_label} (first 5s)")
-        st.pyplot(fig2)
+
+        # display noisy and selected waveforms using helper (supports mpl or plotly)
+        k1, fig1 = display_waveform(noisy_data, fs, title="Noisy (first 5s)", max_seconds=5)
+        k2, fig2o = display_waveform(sel_sig, fs, title=f"{select_label} (first 5s)", max_seconds=5)
+
+        # show noisy
+        if k1 == "mpl":
+            st.pyplot(fig1)
+        elif k1 == "plotly":
+            st.plotly_chart(fig1, use_container_width=True)
+        else:
+            st.info("Noisy waveform plot unavailable.")
+
+        # show selected
+        if k2 == "mpl":
+            st.pyplot(fig2o)
+        elif k2 == "plotly":
+            st.plotly_chart(fig2o, use_container_width=True)
+        else:
+            st.info(f"{select_label} waveform plot unavailable.")
 
         st.subheader("Spectrogram (Noisy vs Selected)")
-        fig_s, ax_s = plt.subplots(1,2, figsize=(12,4))
-        f1,t1,S1 = signal.spectrogram(noisy_data, fs=fs, nperseg=2048)
-        ax_s[0].pcolormesh(t1,f1,10*np.log10(S1+1e-12), shading='gouraud'); ax_s[0].set_title('Noisy')
-        f2,t2,S2 = signal.spectrogram(sel_sig, fs=fs, nperseg=2048)
-        ax_s[1].pcolormesh(t2,f2,10*np.log10(S2+1e-12), shading='gouraud'); ax_s[1].set_title(select_label)
-        st.pyplot(fig_s)
+        k1s, spec1 = display_spectrogram(noisy_data, fs, nperseg=2048, title='Spectrogram - Noisy')
+        k2s, spec2 = display_spectrogram(sel_sig, fs, nperseg=2048, title=f"Spectrogram - {select_label}")
+
+        if k1s == "mpl" and k2s == "mpl":
+            # combine into one mpl figure (2 rows)
+            fig_comb, ax_comb = plt.subplots(2,1, figsize=(12,6))
+            f1, t1, S1 = signal.spectrogram(noisy_data, fs=fs, nperseg=2048)
+            ax_comb[0].pcolormesh(t1, f1, 10*np.log10(S1+1e-12), shading='gouraud'); ax_comb[0].set_title('Spectrogram - Noisy')
+            f2, t2, S2 = signal.spectrogram(sel_sig, fs=fs, nperseg=2048)
+            ax_comb[1].pcolormesh(t2, f2, 10*np.log10(S2+1e-12), shading='gouraud'); ax_comb[1].set_title(f"Spectrogram - {select_label}")
+            st.pyplot(fig_comb)
+        else:
+            # show whichever are available
+            if k1s == "mpl":
+                st.pyplot(spec1)
+            elif k1s == "plotly":
+                st.plotly_chart(spec1, use_container_width=True)
+            if k2s == "mpl":
+                st.pyplot(spec2)
+            elif k2s == "plotly":
+                st.plotly_chart(spec2, use_container_width=True)
 
         # playback/download UI for all candidates (quick A/B)
         st.subheader("Playback / Download candidates (A/B test)")
@@ -501,20 +633,17 @@ if st.session_state.get('run_request', False) or sweep_btn:
             s_before = compute_snr(clean_ref[:L], noisy_data[:L]); s_after = compute_snr(clean_ref[:L], sel_sig[:L])
             st.success(f"SNR before: {s_before:.2f} dB | after: {s_after:.2f} dB | improvement: {s_after-s_before:.2f} dB")
 
-        # download report
+        # download report (safe)
         pdf_buf = io.BytesIO()
-        with PdfPages(pdf_buf) as pdf:
-            fig_cover = plt.figure(figsize=(8.27,11.69)); plt.axis('off')
-            plt.text(0.5,0.9,"Audio Denoise Report", ha='center', fontsize=16)
-            plt.text(0.1,0.84, f"Mode: {mode}", fontsize=10)
-            plt.text(0.1,0.80, f"Aggressiveness: {aggr_val} | alpha: {alpha:.2f} | noise_frames: {noise_frames}", fontsize=9)
-            pdf.savefig(fig_cover); plt.close(fig_cover)
-            fig_s2, ax_s2 = plt.subplots(2,1, figsize=(8.27,11.69))
-            ax_s2[0].pcolormesh(t1,f1,10*np.log10(S1+1e-12), shading='gouraud'); ax_s2[0].set_title('Spectrogram - Noisy')
-            ax_s2[1].pcolormesh(t2,f2,10*np.log10(S2+1e-12), shading='gouraud'); ax_s2[1].set_title('Spectrogram - Processed')
-            pdf.savefig(fig_s2); plt.close(fig_s2)
-        pdf_buf.seek(0)
-        st.download_button("Download report (PDF)", data=pdf_buf.getvalue(), file_name="denoise_report.pdf")
+        if MATPLOTLIB_AVAILABLE and PdfPages is not None:
+            ok = build_pdf_report_safe(pdf_buf, noisy_data, sel_sig, fs, title="Audio Denoise Report")
+            if ok:
+                pdf_buf.seek(0)
+                st.download_button("Download report (PDF)", data=pdf_buf.getvalue(), file_name="denoise_report.pdf")
+            else:
+                st.warning("PDF report generation failed even though matplotlib appears available.")
+        else:
+            st.info("PDF report not available because matplotlib is not installed on the server. To enable reports, add matplotlib to requirements and rebuild the app.")
 
 st.markdown("---")
 st.write("Hints: If bass still sounds reduced, increase Aggressiveness slider (this also increases LF restoration mix) or use Auto-tune sweep and pick the candidate that sounds best. If a particular 50/60Hz hum remains, add a manual notch at ~50 or ~60 Hz in Manual mode.")
