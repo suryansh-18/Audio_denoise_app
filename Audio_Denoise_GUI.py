@@ -24,7 +24,18 @@ except Exception:
     px = None
     PLOTLY_AVAILABLE = False
 
-from scipy import signal
+# defensive import for scipy.signal — show user-friendly message if missing
+try:
+    from scipy import signal
+    SCIPY_AVAILABLE = True
+except Exception as e:
+    signal = None
+    SCIPY_AVAILABLE = False
+    missing_scipy_exc = e
+    st.error("Required package `scipy` is not available in this environment. Check Build logs in Manage app → Logs → Build logs. The app cannot process audio without SciPy.")
+    # stop further execution early so the redacted ModuleNotFoundError doesn't appear
+    st.stop()
+
 import wave
 
 # Optional backends
@@ -647,3 +658,4 @@ if st.session_state.get('run_request', False) or sweep_btn:
 
 st.markdown("---")
 st.write("Hints: If bass still sounds reduced, increase Aggressiveness slider (this also increases LF restoration mix) or use Auto-tune sweep and pick the candidate that sounds best. If a particular 50/60Hz hum remains, add a manual notch at ~50 or ~60 Hz in Manual mode.")
+
